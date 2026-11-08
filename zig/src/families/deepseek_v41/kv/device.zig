@@ -39,17 +39,37 @@ pub const DevicePool = struct {
     staging: ?cuda.copy_source.Buffer = null,
 
     /// Allocates every family's tensor (zeroed) and the tables for `slots` slots of up to `max_pages` pages.
-    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, ctx: *const cuda.Context, pool: *Pool, compute: cuda.Stream, slots: u32, max_pages: u32) !DevicePool {
+    /// With `carve` (the GB10 display reservation, cuda/carveout.zig) a family's tensor is taken from it while it
+    /// fits and from device memory otherwise: those bytes then cost the device nothing, and `carve_bytes` says how
+    /// many moved. The carveout is owned by the caller (Kv), not by this value.
+    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, ctx: *const cuda.Context, pool: *Pool, compute: cuda.Stream, slots: u32, max_pages: u32, carve: ?*cuda.Carveout) !DevicePool {
         const fams = pool.layout.families;
         const t = try gpa.alloc(cuda.DeviceBuffer, fams.len);
         errdefer gpa.free(t);
         var made: usize = 0;
         errdefer for (t[0..made]) |*b| b.free();
+        var carved: usize = 0; // families that came from the carveout
+        var carve_bytes: usize = 0;
         for (fams, 0..) |f, i| {
-            t[i] = try cuda.DeviceBuffer.alloc(d, @as(usize, pool.familyTensorPages(f)) * f.pageBytes(pool.page));
+            const want = @as(usize, pool.familyTensorPages(f)) * f.pageBytes(pool.page);
+            if (carve) |c| {
+                if (try c.take(want)) |b| {
+                    t[i] = b; // borrowed: fill and free leave the carveout's span alone otherwise
+                    carved += 1;
+                    carve_bytes += want;
+                    made += 1;
+                    try t[i].fill8(0, compute.handle);
+                    continue;
+                }
+            }
+            t[i] = try cuda.DeviceBuffer.alloc(d, want);
             made += 1;
             try t[i].fill8(0, compute.handle);
         }
+        if (carve) |c| std.log.info(
+            "[tensorfold] display-KV: {d} of {d} families ({d} MiB) in the display carveout, {d} MiB of it spare; those bytes cost the device nothing",
+            .{ carved, fams.len, carve_bytes >> 20, c.freeBytes() >> 20 },
+        );
         const n = @as(usize, slots) * max_pages;
         var table = try cuda.DeviceBuffer.alloc(d, n * 4);
         errdefer table.free();

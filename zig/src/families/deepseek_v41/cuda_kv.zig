@@ -71,10 +71,15 @@ pub fn bootCheck(ctx: *const cuda.Context, cfg: *const Config, o: Options, rank:
         return error.BadFloor;
     }
     var layout = try kv.Layout.fromConfig(cfg, .{ .split = o.split and world > 1 });
+    // the carveout's share of the pool does not come out of the host's free memory: tell the check how much it covers
+    const carve_gib: f64 = if (try cuda.carveout.requested(false, std.c.getenv("TF_CUDA_CARVEOUT"), std.c.getenv("TF_CUDA_CARVEOUT_MIB"))) |w|
+        @as(f64, @floatFromInt(@min(w, budget.poolBytes(layout.pool(), world, o.tokens)))) / budget.GiB
+    else
+        0;
     // Zig's terms, not the reference's: its plan holds from boot what a caching allocator takes while serving
     var terms = try budget.zigFromEnv();
     terms.growth += @as(f64, @floatFromInt(o.resident + mirrorBytes(&layout, o, world))) / budget.GiB;
-    const r = budget.serveCheck(knobs, .{ .rank = rank, .avail_gib = @as(f64, @floatFromInt(mi.available)) / budget.GiB, .terms = terms }, layout.pool(), world, o.tokens);
+    const r = budget.serveCheck(knobs, .{ .rank = rank, .avail_gib = @as(f64, @floatFromInt(mi.available)) / budget.GiB, .terms = terms, .carveout_gib = carve_gib }, layout.pool(), world, o.tokens);
     var buf: [1024]u8 = undefined;
     if (!r.ok) {
         std.log.err("kv: {s}", .{r.message(&buf)});
@@ -145,6 +150,8 @@ pub const Kv = struct {
     pin_up: ?cuda.HostBuffer = null,
     /// TF_DSV41_KV_MIRROR: each slot's first positions of every source whole on this rank (null: off)
     mirror: ?Mirror = null,
+    /// TF_CUDA_CARVEOUT: the GB10 display reservation, holding as many of the pool's families as fit (null: off)
+    carve: ?cuda.Carveout = null,
 
     pub const Stats = struct { dense: u64 = 0, unions: u64 = 0, union_rows_max: u64 = 0, bytes: u64 = 0 };
 
@@ -159,7 +166,18 @@ pub const Kv = struct {
         errdefer gpa.free(k.slots);
         for (k.slots) |*s| s.* = try k.pool.newSlot(o.capacity);
         k.slot = k.slots[0];
-        k.dev = try kv.DevicePool.init(gpa, d, ctx, &k.pool, runner.stream, @intCast(k.slots.len), k.slot.max_pages);
+        // TF_CUDA_CARVEOUT[_MIB]: the display reservation as device memory (cuda/carveout.zig). Families taken from
+        // it cost the device nothing, so the pool's device footprint drops by that much.
+        if (try cuda.carveout.requested(false, std.c.getenv("TF_CUDA_CARVEOUT"), std.c.getenv("TF_CUDA_CARVEOUT_MIB"))) |want| {
+            const card = std.c.getenv("TF_CUDA_CARVEOUT_CARD") orelse cuda.carveout.default_card;
+            k.carve = cuda.Carveout.open(d, card, want) catch |e| {
+                std.log.err("[tensorfold] TF_CUDA_CARVEOUT: cannot map the display reservation ({t}): the host must be headless with nvidia_drm modeset=1 fbdev=0 and the UEFI reservation at 2 GB or more", .{e});
+                return e;
+            };
+            std.log.info("[tensorfold] TF_CUDA_CARVEOUT: {d} MiB of the display reservation mapped and registered", .{want >> 20});
+        }
+        errdefer if (k.carve) |*c| c.close();
+        k.dev = try kv.DevicePool.init(gpa, d, ctx, &k.pool, runner.stream, @intCast(k.slots.len), k.slot.max_pages, if (k.carve) |*c| c else null);
         errdefer k.dev.deinit();
         k.ops = .{ .r = runner };
         if (o.mirror > 0 and k.layout.opts.split) {
@@ -219,6 +237,9 @@ pub const Kv = struct {
         if (k.pin_up) |*b| b.free();
         if (k.mirror) |*m| m.deinit();
         k.dev.deinit();
+        // the families taken from the carveout are borrowed: the pool's tensors are released above, so the mapping
+        // can go back to the display reservation now
+        if (k.carve) |*c| c.close();
         k.pool.deinit();
         k.gpa.free(k.slots);
         k.gpa.destroy(k);

@@ -273,6 +273,9 @@ pub const Measured = struct {
     rank: u32,
     avail_gib: f64,
     terms: Serve,
+    /// TF_CUDA_CARVEOUT: GiB of the pool that live in the display carveout instead of in RAM/device memory, so they
+    /// do not come out of `avail_gib` (the boot check would otherwise refuse a pool the carveout already covers).
+    carveout_gib: f64 = 0,
 };
 
 pub const Result = struct {
@@ -321,7 +324,10 @@ pub fn worstAt(avail_gib: f64, pool_gib: f64, terms: Serve) f64 {
 pub fn serveCheck(k: Knobs, m: Measured, layout: sessions.Layout, world: u32, pool_tokens: u64) Result {
     const per = tokenBytes(layout, world);
     const pool_gib = @as(f64, @floatFromInt(poolBytes(layout, world, pool_tokens))) / GiB;
-    const worst = worstAt(m.avail_gib, pool_gib, m.terms);
+    // the carveout's share of the pool is not taken from `avail_gib`: the display reservation is already out of the
+    // host's free memory, so charging it twice would refuse a pool that fits
+    const from_ram = @max(0, pool_gib - m.carveout_gib);
+    const worst = worstAt(m.avail_gib, from_ram, m.terms);
     var split = false;
     for (layout.families) |f| split = split or (f.split and world > 1);
     const largest = largestPool(m.avail_gib, m.terms, k.hard_gib, per);
@@ -514,4 +520,27 @@ test "the Zig check: measured at the end of boot, a measured rank 1 passes, a po
     try std.testing.expectApproxEqAbs(@as(f64, 14.94 - pool - 8.76), r.growth, 1e-9); // growth from the true idle
     try std.testing.expect(!afterBoot(14.94, pool, 7.33, 1.5, zig_dip_gib, k.hard_gib, 3_000_000, per).ok);
     try std.testing.expectEqual(@as(f64, 0), try reserveFromEnv());
+}
+
+test "the carveout's share of the pool is not charged to the host's free memory" {
+    // a pool that would breach the floor as ordinary memory is admitted when the carveout covers that much of it
+    var layout = try @import("layout.zig").Layout.fromConfig(@import("layout.zig").Release{}, .{});
+    var k: Knobs = .{ .hard_gib = 4.0 };
+    const tokens: u64 = 2_200_000;
+    const pool_gib: f64 = @as(f64, @floatFromInt(poolBytes(layout.pool(), 1, tokens))) / GiB;
+    var terms: Serve = .{};
+    const without = serveCheck(k, .{ .rank = 0, .avail_gib = pool_gib + 4.2, .terms = terms }, layout.pool(), 1, tokens);
+    try std.testing.expect(without.ok);
+    // a smaller host leaves no room for the pool as ordinary memory…
+    const tight = serveCheck(k, .{ .rank = 0, .avail_gib = 4.6, .terms = terms }, layout.pool(), 1, tokens);
+    try std.testing.expect(!tight.ok);
+    // …but the same pool fits when the carveout holds all of it
+    const carved = serveCheck(k, .{ .rank = 0, .avail_gib = 4.6, .terms = terms, .carveout_gib = pool_gib }, layout.pool(), 1, tokens);
+    try std.testing.expect(carved.ok);
+    // and a partial carveout is charged for the rest only
+    const half = serveCheck(k, .{ .rank = 0, .avail_gib = pool_gib / 2 + 4.6, .terms = terms, .carveout_gib = pool_gib / 2 }, layout.pool(), 1, tokens);
+    try std.testing.expect(half.ok);
+    _ = &k;
+    _ = &layout;
+    _ = &terms;
 }
